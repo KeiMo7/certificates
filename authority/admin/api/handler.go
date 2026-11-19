@@ -91,6 +91,10 @@ func Route(r api.Router, options ...RouterOption) {
 	r.MethodFunc("PATCH", "/admins/{id}", authnz(UpdateAdmin))
 	r.MethodFunc("DELETE", "/admins/{id}", authnz(DeleteAdmin))
 
+	// Short-lived certificate batch revocation
+	r.MethodFunc("POST", "/revocations/batch/preview", authnz(PreviewRevokeBatch))
+	r.MethodFunc("POST", "/revocations/batch", authnz(RevokeBatch))
+
 	// ACME responder
 	if router.acmeResponder != nil {
 		// ACME External Account Binding Keys

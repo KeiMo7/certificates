@@ -3,15 +3,19 @@ package db
 import (
 	"bytes"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"math/big"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/nosql"
 	"github.com/smallstep/nosql/database"
+	tassert "github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestIsRevoked(t *testing.T) {
@@ -98,6 +102,111 @@ func TestRevoke(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDB_RevokeBatch(t *testing.T) {
+	newRecord := func(i int) *RevokedCertificateInfo {
+		return &RevokedCertificateInfo{
+			Serial:    big.NewInt(int64(i)).String(),
+			RevokedAt: time.Unix(int64(i), 0).UTC(),
+			ExpiresAt: time.Unix(int64(i+100), 0).UTC(),
+		}
+	}
+
+	t.Run("ok", func(t *testing.T) {
+		records := make([]*RevokedCertificateInfo, 50)
+		for i := range records {
+			records[i] = newRecord(i + 1)
+		}
+
+		var ops *database.Tx
+		d := &DB{&MockNoSQLDB{
+			Err: database.ErrNotFound,
+			MUpdate: func(tx *database.Tx) error {
+				ops = tx
+				return nil
+			},
+		}, true}
+		require.NoError(t, d.RevokeBatch(records))
+		require.NotNil(t, ops)
+		require.Len(t, ops.Operations, 50)
+		for i, op := range ops.Operations {
+			tassert.Equal(t, revokedCertsTable, op.Bucket)
+			tassert.Equal(t, []byte(records[i].Serial), op.Key)
+			var got RevokedCertificateInfo
+			require.NoError(t, json.Unmarshal(op.Value, &got))
+			tassert.Equal(t, *records[i], got)
+		}
+	})
+
+	t.Run("transaction failure", func(t *testing.T) {
+		d := &DB{&MockNoSQLDB{
+			Err: database.ErrNotFound,
+			MUpdate: func(tx *database.Tx) error {
+				return errors.New("force")
+			},
+		}, true}
+		err := d.RevokeBatch([]*RevokedCertificateInfo{newRecord(1), newRecord(2)})
+		require.Error(t, err)
+		tassert.Contains(t, err.Error(), "error committing revocation batch")
+	})
+
+	t.Run("already exists", func(t *testing.T) {
+		updateCalled := false
+		d := &DB{&MockNoSQLDB{
+			MGet: func(bucket, key []byte) ([]byte, error) {
+				return []byte("exists"), nil
+			},
+			MUpdate: func(tx *database.Tx) error {
+				updateCalled = true
+				return nil
+			},
+		}, true}
+		err := d.RevokeBatch([]*RevokedCertificateInfo{newRecord(1), newRecord(2)})
+		tassert.ErrorIs(t, err, ErrAlreadyExists)
+		tassert.False(t, updateCalled)
+	})
+
+	t.Run("duplicate input", func(t *testing.T) {
+		d := &DB{&MockNoSQLDB{Err: database.ErrNotFound}, true}
+		err := d.RevokeBatch([]*RevokedCertificateInfo{newRecord(1), newRecord(1)})
+		require.Error(t, err)
+		tassert.Contains(t, err.Error(), "duplicated")
+	})
+}
+
+func TestDB_DeleteExpiredRevocations(t *testing.T) {
+	now := time.Now().UTC()
+	expired, err := json.Marshal(&RevokedCertificateInfo{Serial: "1", ExpiresAt: now.Add(-time.Minute)})
+	require.NoError(t, err)
+	valid, err := json.Marshal(&RevokedCertificateInfo{Serial: "2", ExpiresAt: now.Add(time.Minute)})
+	require.NoError(t, err)
+	unknown, err := json.Marshal(&RevokedCertificateInfo{Serial: "3"})
+	require.NoError(t, err)
+
+	var ops *database.Tx
+	d := &DB{&MockNoSQLDB{
+		MList: func(bucket []byte) ([]*database.Entry, error) {
+			tassert.Equal(t, revokedCertsTable, bucket)
+			return []*database.Entry{
+				{Bucket: revokedCertsTable, Key: []byte("1"), Value: expired},
+				{Bucket: revokedCertsTable, Key: []byte("2"), Value: valid},
+				{Bucket: revokedCertsTable, Key: []byte("3"), Value: unknown},
+			}, nil
+		},
+		MUpdate: func(tx *database.Tx) error {
+			ops = tx
+			return nil
+		},
+	}, true}
+
+	deleted, err := d.DeleteExpiredRevocations(now)
+	require.NoError(t, err)
+	tassert.Equal(t, 1, deleted)
+	require.NotNil(t, ops)
+	require.Len(t, ops.Operations, 1)
+	tassert.Equal(t, database.Delete, ops.Operations[0].Cmd)
+	tassert.Equal(t, []byte("1"), ops.Operations[0].Key)
 }
 
 func TestUseToken(t *testing.T) {

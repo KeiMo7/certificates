@@ -41,6 +41,16 @@ func (s *SimpleDB) Revoke(*RevokedCertificateInfo) error {
 	return ErrNotImplemented
 }
 
+// RevokeBatch returns a "NotImplemented" error.
+func (s *SimpleDB) RevokeBatch([]*RevokedCertificateInfo) error {
+	return ErrNotImplemented
+}
+
+// DeleteExpiredRevocations returns a "NotImplemented" error.
+func (s *SimpleDB) DeleteExpiredRevocations(time.Time) (int, error) {
+	return 0, ErrNotImplemented
+}
+
 // GetRevokedCertificates returns a "NotImplemented" error.
 func (s *SimpleDB) GetRevokedCertificates() (*[]RevokedCertificateInfo, error) {
 	return nil, ErrNotImplemented

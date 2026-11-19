@@ -87,6 +87,10 @@ type Authority struct {
 	crlStopper chan struct{}
 	crlMutex   sync.Mutex
 
+	// Short-lived certificate revocation feed maintenance
+	revocationTicker  *time.Ticker
+	revocationStopper chan struct{}
+
 	// If true, do not re-initialize
 	initOnce  bool
 	startTime time.Time
@@ -860,6 +864,13 @@ func (a *Authority) init() error {
 		}
 	}
 
+	// Start expired revocation record cleanup.
+	if a.config.Revocation.IsEnabled() {
+		if err := a.startRevocationCleanup(); err != nil {
+			return err
+		}
+	}
+
 	// JWT numeric dates are seconds.
 	a.startTime = time.Now().Truncate(time.Second)
 	// Set flag indicating that initialization has been completed, and should
@@ -941,6 +952,10 @@ func (a *Authority) Shutdown() error {
 		a.crlTicker.Stop()
 		close(a.crlStopper)
 	}
+	if a.revocationTicker != nil {
+		a.revocationTicker.Stop()
+		close(a.revocationStopper)
+	}
 
 	if err := a.keyManager.Close(); err != nil {
 		log.Printf("error closing the key manager: %v", err)
@@ -953,6 +968,10 @@ func (a *Authority) CloseForReload() {
 	if a.crlTicker != nil {
 		a.crlTicker.Stop()
 		close(a.crlStopper)
+	}
+	if a.revocationTicker != nil {
+		a.revocationTicker.Stop()
+		close(a.revocationStopper)
 	}
 
 	if err := a.keyManager.Close(); err != nil {

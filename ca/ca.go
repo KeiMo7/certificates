@@ -247,6 +247,8 @@ func (ca *CA) Init(cfg *config.Config) (*CA, error) {
 	// Mount the CRL to the insecure mux
 	insecureMux.Get("/crl", api.CRL)
 	insecureMux.Get("/1.0/crl", api.CRL)
+	insecureMux.Get("/revocations", api.Revocations)
+	insecureMux.Get("/1.0/revocations", api.Revocations)
 
 	// Add ACME api endpoints in /acme and /1.0/acme
 	dns := cfg.DNSNames[0]

@@ -230,6 +230,48 @@ func (db *DB) Revoke(rci *RevokedCertificateInfo) error {
 	}
 }
 
+// RevokeBatch adds multiple certificates to the revocation table atomically.
+// The preflight check rejects the whole batch if any serial is already revoked;
+// the writes are then committed in a single database transaction.
+func (db *DB) RevokeBatch(rcis []*RevokedCertificateInfo) error {
+	if len(rcis) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(rcis))
+	encoded := make([][]byte, len(rcis))
+	for i, rci := range rcis {
+		if rci == nil || rci.Serial == "" {
+			return errors.New("revoked certificate serial cannot be empty")
+		}
+		if _, ok := seen[rci.Serial]; ok {
+			return errors.Errorf("serial number %s is duplicated in batch", rci.Serial)
+		}
+		seen[rci.Serial] = struct{}{}
+
+		b, err := json.Marshal(rci)
+		if err != nil {
+			return errors.Wrap(err, "error marshaling revoked certificate info")
+		}
+		encoded[i] = b
+
+		if _, err := db.Get(revokedCertsTable, []byte(rci.Serial)); err == nil {
+			return ErrAlreadyExists
+		} else if !nosql.IsErrNotFound(err) {
+			return errors.Wrap(err, "error checking revocation bucket")
+		}
+	}
+
+	tx := new(database.Tx)
+	for i, rci := range rcis {
+		tx.Set(revokedCertsTable, []byte(rci.Serial), encoded[i])
+	}
+	if err := db.Update(tx); err != nil {
+		return errors.Wrap(err, "error committing revocation batch")
+	}
+	return nil
+}
+
 // RevokeSSH adds a SSH certificate to the revocation table.
 func (db *DB) RevokeSSH(rci *RevokedCertificateInfo) error {
 	rcib, err := json.Marshal(rci)
@@ -263,6 +305,37 @@ func (db *DB) GetRevokedCertificates() (*[]RevokedCertificateInfo, error) {
 		revokedCerts = append(revokedCerts, data)
 	}
 	return &revokedCerts, nil
+}
+
+// DeleteExpiredRevocations deletes revocation records whose certificate
+// expiration is at or before cutoff. Records without a known expiration are
+// retained to avoid deleting data that may still be needed.
+func (db *DB) DeleteExpiredRevocations(cutoff time.Time) (int, error) {
+	entries, err := db.List(revokedCertsTable)
+	if err != nil {
+		return 0, err
+	}
+
+	tx := new(database.Tx)
+	var deleted int
+	for _, e := range entries {
+		var data RevokedCertificateInfo
+		if err := json.Unmarshal(e.Value, &data); err != nil {
+			return 0, err
+		}
+		if data.ExpiresAt.IsZero() || data.ExpiresAt.After(cutoff) {
+			continue
+		}
+		tx.Del(revokedCertsTable, e.Key)
+		deleted++
+	}
+	if deleted == 0 {
+		return 0, nil
+	}
+	if err := db.Update(tx); err != nil {
+		return 0, errors.Wrap(err, "error deleting expired revocations")
+	}
+	return deleted, nil
 }
 
 // StoreCRL stores a CRL in the DB
@@ -488,23 +561,25 @@ func (db *DB) Shutdown() error {
 
 // MockAuthDB mocks the AuthDB interface. //
 type MockAuthDB struct {
-	Err                     error
-	Ret1                    any
-	MIsRevoked              func(string) (bool, error)
-	MIsSSHRevoked           func(string) (bool, error)
-	MRevoke                 func(rci *RevokedCertificateInfo) error
-	MRevokeSSH              func(rci *RevokedCertificateInfo) error
-	MGetCertificate         func(serialNumber string) (*x509.Certificate, error)
-	MGetCertificateData     func(serialNumber string) (*CertificateData, error)
-	MStoreCertificate       func(crt *x509.Certificate) error
-	MUseToken               func(id, tok string) (bool, error)
-	MIsSSHHost              func(principal string) (bool, error)
-	MStoreSSHCertificate    func(crt *ssh.Certificate) error
-	MGetSSHHostPrincipals   func() ([]string, error)
-	MShutdown               func() error
-	MGetRevokedCertificates func() (*[]RevokedCertificateInfo, error)
-	MGetCRL                 func() (*CertificateRevocationListInfo, error)
-	MStoreCRL               func(*CertificateRevocationListInfo) error
+	Err                       error
+	Ret1                      any
+	MIsRevoked                func(string) (bool, error)
+	MIsSSHRevoked             func(string) (bool, error)
+	MRevoke                   func(rci *RevokedCertificateInfo) error
+	MRevokeBatch              func(rcis []*RevokedCertificateInfo) error
+	MRevokeSSH                func(rci *RevokedCertificateInfo) error
+	MGetCertificate           func(serialNumber string) (*x509.Certificate, error)
+	MGetCertificateData       func(serialNumber string) (*CertificateData, error)
+	MStoreCertificate         func(crt *x509.Certificate) error
+	MUseToken                 func(id, tok string) (bool, error)
+	MIsSSHHost                func(principal string) (bool, error)
+	MStoreSSHCertificate      func(crt *ssh.Certificate) error
+	MGetSSHHostPrincipals     func() ([]string, error)
+	MShutdown                 func() error
+	MGetRevokedCertificates   func() (*[]RevokedCertificateInfo, error)
+	MDeleteExpiredRevocations func(time.Time) (int, error)
+	MGetCRL                   func() (*CertificateRevocationListInfo, error)
+	MStoreCRL                 func(*CertificateRevocationListInfo) error
 }
 
 func (m *MockAuthDB) GetRevokedCertificates() (*[]RevokedCertificateInfo, error) {
@@ -561,6 +636,28 @@ func (m *MockAuthDB) Revoke(rci *RevokedCertificateInfo) error {
 		return m.MRevoke(rci)
 	}
 	return m.Err
+}
+
+// RevokeBatch mock.
+func (m *MockAuthDB) RevokeBatch(rcis []*RevokedCertificateInfo) error {
+	if m.MRevokeBatch != nil {
+		return m.MRevokeBatch(rcis)
+	}
+	return m.Err
+}
+
+// DeleteExpiredRevocations mock.
+func (m *MockAuthDB) DeleteExpiredRevocations(cutoff time.Time) (int, error) {
+	if m.MDeleteExpiredRevocations != nil {
+		return m.MDeleteExpiredRevocations(cutoff)
+	}
+	if m.Ret1 == nil {
+		return 0, m.Err
+	}
+	if n, ok := m.Ret1.(int); ok {
+		return n, m.Err
+	}
+	return 0, m.Err
 }
 
 // RevokeSSH mock.

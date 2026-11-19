@@ -17,6 +17,7 @@ import (
 	"github.com/smallstep/certificates/authority/provisioner"
 	cas "github.com/smallstep/certificates/cas/apiv1"
 	"github.com/smallstep/certificates/db"
+	"github.com/smallstep/certificates/revocation"
 	"github.com/smallstep/certificates/templates"
 )
 
@@ -44,6 +45,18 @@ var (
 	// DefaultCRLExpiredDuration is the default duration in which expired
 	// certificates will remain in the CRL after expiration.
 	DefaultCRLExpiredDuration = time.Hour
+	// DefaultRevocationRefreshInterval is the recommended polling interval for
+	// the short-lived certificate revocation feed.
+	DefaultRevocationRefreshInterval = 10 * time.Second
+	// DefaultRevocationCacheDuration is the maximum age of a revocation
+	// snapshot that a verifier should treat as fresh by default.
+	DefaultRevocationCacheDuration = 5 * time.Second
+	// DefaultRevocationCleanupInterval is how often expired revocation records
+	// are removed.
+	DefaultRevocationCleanupInterval = time.Minute
+	// DefaultRevocationFailurePolicy is conservative by default: if status
+	// cannot be confirmed, verification fails.
+	DefaultRevocationFailurePolicy = revocation.FailClosed
 	// GlobalProvisionerClaims is the default duration that expired certificates
 	// remain in the CRL after expiration.
 	GlobalProvisionerClaims = provisioner.Claims{
@@ -83,6 +96,7 @@ type Config struct {
 	Templates        *templates.Templates `json:"templates,omitempty"`
 	CommonName       string               `json:"commonName,omitempty"`
 	CRL              *CRLConfig           `json:"crl,omitempty"`
+	Revocation       *RevocationConfig    `json:"revocation,omitempty"`
 	MetricsAddress   string               `json:"metricsAddress,omitempty"`
 	SkipValidation   bool                 `json:"-"`
 
@@ -97,6 +111,104 @@ type CRLConfig struct {
 	CacheDuration    *provisioner.Duration `json:"cacheDuration,omitempty"`
 	RenewPeriod      *provisioner.Duration `json:"renewPeriod,omitempty"`
 	IDPurl           string                `json:"idpURL,omitempty"`
+}
+
+// RevocationConfig configures the short-lived certificate revocation feed.
+// The feed is disabled by default, leaving the existing CRL/OCSP behavior
+// unchanged.
+type RevocationConfig struct {
+	Enabled         bool                     `json:"enabled"`
+	RefreshInterval *provisioner.Duration    `json:"refreshInterval,omitempty"`
+	CacheDuration   *provisioner.Duration    `json:"cacheDuration,omitempty"`
+	CleanupInterval *provisioner.Duration    `json:"cleanupInterval,omitempty"`
+	Retention       *provisioner.Duration    `json:"retention,omitempty"`
+	FailurePolicy   revocation.FailurePolicy `json:"failurePolicy,omitempty"`
+}
+
+// IsEnabled returns whether the revocation feed is enabled.
+func (c *RevocationConfig) IsEnabled() bool {
+	return c != nil && c.Enabled
+}
+
+// Init sets defaults for an enabled revocation feed.
+func (c *RevocationConfig) Init() {
+	if c == nil {
+		return
+	}
+	if c.RefreshInterval == nil {
+		c.RefreshInterval = &provisioner.Duration{Duration: DefaultRevocationRefreshInterval}
+	}
+	if c.CacheDuration == nil {
+		c.CacheDuration = &provisioner.Duration{Duration: DefaultRevocationCacheDuration}
+	}
+	if c.CleanupInterval == nil {
+		c.CleanupInterval = &provisioner.Duration{Duration: DefaultRevocationCleanupInterval}
+	}
+	if c.FailurePolicy == "" {
+		c.FailurePolicy = DefaultRevocationFailurePolicy
+	}
+}
+
+// Validate validates the revocation feed configuration.
+func (c *RevocationConfig) Validate() error {
+	if c == nil {
+		return nil
+	}
+	if c.RefreshInterval != nil && c.RefreshInterval.Duration <= 0 {
+		return errors.New("revocation.refreshInterval must be greater than 0")
+	}
+	if c.CacheDuration != nil && c.CacheDuration.Duration < 0 {
+		return errors.New("revocation.cacheDuration must be greater than or equal to 0")
+	}
+	if c.CleanupInterval != nil && c.CleanupInterval.Duration <= 0 {
+		return errors.New("revocation.cleanupInterval must be greater than 0")
+	}
+	if c.Retention != nil && c.Retention.Duration < 0 {
+		return errors.New("revocation.retention must be greater than or equal to 0")
+	}
+	if c.Enabled && c.CacheTTL() > c.PollInterval() {
+		return errors.New("revocation.cacheDuration must be less than or equal to revocation.refreshInterval")
+	}
+	if c.FailurePolicy != "" {
+		if err := c.FailurePolicy.Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PollInterval returns the configured feed refresh interval.
+func (c *RevocationConfig) PollInterval() time.Duration {
+	if c == nil || c.RefreshInterval == nil {
+		return DefaultRevocationRefreshInterval
+	}
+	return c.RefreshInterval.Duration
+}
+
+// CacheTTL returns the configured snapshot cache duration.
+func (c *RevocationConfig) CacheTTL() time.Duration {
+	if c == nil || c.CacheDuration == nil {
+		return DefaultRevocationCacheDuration
+	}
+	return c.CacheDuration.Duration
+}
+
+// CleanupEvery returns the configured cleanup interval.
+func (c *RevocationConfig) CleanupEvery() time.Duration {
+	if c == nil || c.CleanupInterval == nil {
+		return DefaultRevocationCleanupInterval
+	}
+	return c.CleanupInterval.Duration
+}
+
+// CleanupCutoff returns the newest expiration time that may be cleaned. The
+// retention period is an optional audit grace period after certificate expiry.
+func (c *RevocationConfig) CleanupCutoff(now time.Time) time.Time {
+	var retention time.Duration
+	if c != nil && c.Retention != nil {
+		retention = c.Retention.Duration
+	}
+	return now.Add(-retention)
 }
 
 // IsEnabled returns if the CRL is enabled.
@@ -255,6 +367,9 @@ func (c *Config) Init() {
 	if c.CRL != nil && c.CRL.Enabled && c.CRL.CacheDuration == nil {
 		c.CRL.CacheDuration = DefaultCRLCacheDuration
 	}
+	if c.Revocation != nil && c.Revocation.Enabled {
+		c.Revocation.Init()
+	}
 	c.AuthorityConfig.init()
 }
 
@@ -374,6 +489,11 @@ func (c *Config) Validate() error {
 
 	// Validate crl config: nil is ok
 	if err := c.CRL.Validate(); err != nil {
+		return err
+	}
+
+	// Validate revocation feed config: nil is ok
+	if err := c.Revocation.Validate(); err != nil {
 		return err
 	}
 

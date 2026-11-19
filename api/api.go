@@ -334,6 +334,7 @@ func Route(r Router) {
 	r.MethodFunc("POST", "/rekey", Rekey)
 	r.MethodFunc("POST", "/revoke", Revoke)
 	r.MethodFunc("GET", "/crl", CRL)
+	r.MethodFunc("GET", "/revocations", Revocations)
 	r.MethodFunc("GET", "/provisioners", Provisioners)
 	r.MethodFunc("GET", "/provisioners/{kid}/encrypted-key", ProvisionerKey)
 	r.MethodFunc("GET", "/roots", Roots)
